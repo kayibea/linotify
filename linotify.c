@@ -1,310 +1,239 @@
-/*
-* Copyright (c) 2009-2017 Robert Hoelz <rob@hoelz.ro>
-*
-* Permission is hereby granted, free of charge, to any person obtaining a copy
-* of this software and associated documentation files (the "Software"), to deal
-* in the Software without restriction, including without limitation the rights
-* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-* copies of the Software, and to permit persons to whom the Software is
-* furnished to do so, subject to the following conditions:
-*
-* The above copyright notice and this permission notice shall be included in
-* all copies or substantial portions of the Software.
-*
-* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-* THE SOFTWARE.
-*/
-
-#include <lua.h>
-#include <lauxlib.h>
-
-#include <sys/inotify.h>
+#define _GNU_SOURCE
 #include <errno.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
+#include <poll.h>
+#include <stdint.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 
-#define MT_NAME "INOTIFY_HANDLE"
-#define READ_BUFFER_SIZE 1024
-#define INVALID_FD (-1)
+#define INOTIFY_MT "INOTIFY_HANDLE"
+#define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + 256))
 
-struct inotify_context {
-    char buffer[READ_BUFFER_SIZE];
-    int offset;
-    int bytes_remaining;
-};
-
-void push_inotify_handle(lua_State *L, int fd)
-{
-    int *udata = (int *) lua_newuserdata(L, sizeof(int));
-    *udata = fd;
-    luaL_getmetatable(L, MT_NAME);
-    lua_setmetatable(L, -2);
-}
-
-int get_inotify_handle(lua_State *L, int index)
-{
-    return *((int *) luaL_checkudata(L, index, MT_NAME));
-}
-
-static int handle_error(lua_State *L)
-{
-    lua_pushnil(L);
-    lua_pushstring(L, strerror(errno));
-    lua_pushinteger(L, errno);
-    return 3;
-}
-
-static int init(lua_State *L)
-{
-    int fd;
-    int flags = 0;
-
-    if(lua_type(L, 1) == LUA_TTABLE) {
-        lua_getfield(L, 1, "blocking");
-
-        if(lua_type(L, -1) != LUA_TNIL && !lua_toboolean(L, -1)) {
-            flags |= IN_NONBLOCK;
-        }
-        lua_pop(L, 1);
-    }
-
-    if((fd = inotify_init1(flags)) == -1) {
-        return handle_error(L);
-    } else {
-        push_inotify_handle(L, fd);
-        return 1;
-    }
-}
-
-static int handle_fileno(lua_State *L)
-{
-    lua_pushinteger(L, get_inotify_handle(L, 1));
-    return 1;
-}
-
-static void
-push_inotify_event(lua_State *L, struct inotify_event *ev)
-{
-    lua_createtable(L, 0, 4);
-
-    lua_pushinteger(L, ev->wd);
-    lua_setfield(L, -2, "wd");
-
-    lua_pushinteger(L, ev->mask);
-    lua_setfield(L, -2, "mask");
-
-    lua_pushinteger(L, ev->cookie);
-    lua_setfield(L, -2, "cookie");
-
-    if(ev->len) {
-        lua_pushstring(L, ev->name);
-        lua_setfield(L, -2, "name");
-    }
-}
-
-static int handle_read(lua_State *L)
-{
-    int fd;
-    int i = 0;
-    int n = 1;
-    ssize_t bytes;
-    struct inotify_event *iev;
-    char buffer[1024];
-
-    fd = get_inotify_handle(L, 1);
-    if((bytes = read(fd, buffer, 1024)) < 0) {
-        if(errno == EAGAIN || errno == EWOULDBLOCK) {
-            lua_newtable(L);
-            return 1;
-        }
-        return handle_error(L);
-    }
-    lua_newtable(L);
-
-    while(bytes >= sizeof(struct inotify_event)) {
-        iev = (struct inotify_event *) (buffer + i);
-
-        push_inotify_event(L, iev);
-        lua_rawseti(L, -2, n++);
-
-        i += (sizeof(struct inotify_event) + iev->len);
-        bytes -= (sizeof(struct inotify_event) + iev->len);
-    }
-
-    return 1;
-}
-
-static int
-handle_events_iterator(lua_State *L)
-{
-    struct inotify_context *context;
-    struct inotify_event *event;
-    int fd;
-
-    fd      = get_inotify_handle(L, 1);
-    context = lua_touserdata(L, lua_upvalueindex(1));
-
-    if(context->bytes_remaining < sizeof(struct inotify_event)) {
-        context->offset = 0;
-
-        if((context->bytes_remaining = read(fd, context->buffer, READ_BUFFER_SIZE)) < 0) {
-            if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                lua_pushnil(L);
-                return 1;
-            }
-            return luaL_error(L, "read error: %s\n", strerror(errno));
-        }
-    }
-    event = (struct inotify_event *) (context->buffer + context->offset);
-
-    context->bytes_remaining -= (sizeof(struct inotify_event) + event->len);
-    context->offset          += (sizeof(struct inotify_event) + event->len);
-
-    push_inotify_event(L, event);
-
-    return 1;
-}
-
-static int
-handle_events(lua_State *L)
-{
-    struct inotify_context *context;
-
-    context = lua_newuserdata(L, sizeof(struct inotify_context));
-
-    memset(context, 0, sizeof(struct inotify_context));
-
-    lua_pushcclosure(L, handle_events_iterator, 1);
-    lua_pushvalue(L, 1);
-
-    return 2;
-}
-
-static int handle_close(lua_State *L)
-{
-    int *fd = (int *) luaL_checkudata(L, 1, MT_NAME);
-    if( *fd != INVALID_FD ){
-        close(*fd);
-        *fd = INVALID_FD;
-    }
-    return 0;
-}
-
-static int handle_add_watch(lua_State *L)
-{
-    int fd;
-    int wd;
-    int top;
-    int i;
-    const char *path;
-    uint32_t mask = 0;
-
-    fd = get_inotify_handle(L, 1);
-    path = luaL_checkstring(L, 2);
-    top = lua_gettop(L);
-    for(i = 3; i <= top; i++) {
-        mask |= luaL_checkinteger(L, i);
-    }
-
-    if((wd = inotify_add_watch(fd, path, mask)) == -1) {
-        return handle_error(L);
-    } else {
-        lua_pushinteger(L, wd);
-        return 1;
-    }
-}
-
-static int handle_rm_watch(lua_State *L)
-{
-    int fd;
-    int wd;
-
-    fd = get_inotify_handle(L, 1);
-    wd = luaL_checkinteger(L, 2);
-
-    if(inotify_rm_watch(fd, wd) == -1) {
-        return handle_error(L);
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int handle__gc(lua_State *L)
-{
-    return handle_close(L);
-}
-
-static luaL_Reg inotify_funcs[] = {
-    {"init", init},
-    {NULL, NULL}
-};
-
-static luaL_Reg handle_funcs[] = {
-    {"read", handle_read},
-    {"close", handle_close},
-    {"addwatch", handle_add_watch},
-    {"rmwatch", handle_rm_watch},
-    {"fileno", handle_fileno},
-    {"getfd", handle_fileno},
-    {"events", handle_events},
-    {NULL, NULL}
-};
-
-#define register_constant(s)\
-    lua_pushinteger(L, s);\
-    lua_setfield(L, -2, #s);
-
-int luaopen_inotify(lua_State *L)
-{
-    luaL_newmetatable(L, MT_NAME);
-    lua_createtable(L, 0, sizeof(handle_funcs) / sizeof(luaL_Reg) - 1);
-#if LUA_VERSION_NUM > 501
-    luaL_setfuncs(L, handle_funcs, 0);
-#else
-    luaL_register(L, NULL, handle_funcs);
-#endif
-    lua_setfield(L, -2, "__index");
-    lua_pushcfunction(L, handle__gc);
-    lua_setfield(L, -2, "__gc");
-    lua_pushliteral(L, "inotify_handle");
-    lua_setfield(L, -2, "__type");
-    lua_pop(L, 1);
-
-    lua_newtable(L);
-#if LUA_VERSION_NUM > 501
-    luaL_setfuncs(L, inotify_funcs,0);
-#else
-    luaL_register(L, NULL, inotify_funcs);
+#ifndef LUA_OK
+#define LUA_OK 0
 #endif
 
-    register_constant(IN_ACCESS);
-    register_constant(IN_ATTRIB);
-    register_constant(IN_CLOSE_WRITE);
-    register_constant(IN_CLOSE_NOWRITE);
-    register_constant(IN_CREATE);
-    register_constant(IN_DELETE);
-    register_constant(IN_DELETE_SELF);
-    register_constant(IN_MODIFY);
-    register_constant(IN_MOVE_SELF);
-    register_constant(IN_MOVED_FROM);
-    register_constant(IN_MOVED_TO);
-    register_constant(IN_OPEN);
-    register_constant(IN_ALL_EVENTS);
-    register_constant(IN_MOVE);
-    register_constant(IN_CLOSE);
-    register_constant(IN_DONT_FOLLOW);
-    register_constant(IN_MASK_ADD);
-    register_constant(IN_ONESHOT);
-    register_constant(IN_ONLYDIR);
-    register_constant(IN_IGNORED);
-    register_constant(IN_ISDIR);
-    register_constant(IN_Q_OVERFLOW);
-    register_constant(IN_UNMOUNT);
+typedef struct {
+  int fd;
+  int cb_table_ref;
+} inotify_ctx_t;
 
+static int push_luaerror(lua_State* L) {
+  lua_pushnil(L);
+  lua_pushstring(L, strerror(errno));
+  lua_pushinteger(L, (lua_Integer)errno);
+  return 3;
+}
+
+static void push_luaevent(lua_State* L, struct inotify_event* ev) {
+  lua_newtable(L);
+
+  lua_pushstring(L, "wd");
+  lua_pushinteger(L, ev->wd);
+  lua_settable(L, -3);
+
+  lua_pushstring(L, "mask");
+  lua_pushinteger(L, ev->mask);
+  lua_settable(L, -3);
+
+  lua_pushstring(L, "cookie");
+  lua_pushinteger(L, ev->cookie);
+  lua_settable(L, -3);
+
+  lua_pushstring(L, "name");
+  lua_pushstring(L, (ev->len > 0) ? ev->name : "");
+  lua_settable(L, -3);
+}
+
+static int l_add(lua_State* L) {
+  inotify_ctx_t* ctx = luaL_checkudata(L, 1, INOTIFY_MT);
+  const char* path = luaL_checkstring(L, 2);
+  uint32_t mask = (uint32_t)luaL_checkinteger(L, 3);
+  luaL_checktype(L, 4, LUA_TFUNCTION);
+
+  int wd = inotify_add_watch(ctx->fd, path, mask);
+  if (wd < 0) return push_luaerror(L);
+
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->cb_table_ref);
+  lua_pushvalue(L, 4);
+  lua_rawseti(L, -2, wd);
+  lua_pop(L, 1);
+
+  lua_pushinteger(L, wd);
+  return 1;
+}
+
+static int l_remove(lua_State* L) {
+  inotify_ctx_t* ctx = luaL_checkudata(L, 1, INOTIFY_MT);
+  int wd = (int)luaL_checkinteger(L, 2);
+
+  if (inotify_rm_watch(ctx->fd, wd) < 0) return push_luaerror(L);
+
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->cb_table_ref);
+  lua_pushnil(L);
+  lua_rawseti(L, -2, wd);
+  lua_pop(L, 1);
+
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+static int l_close(lua_State* L) {
+  inotify_ctx_t* ctx = luaL_checkudata(L, 1, INOTIFY_MT);
+  int ret = 0;
+
+  if (ctx->fd >= 0) {
+    if (ctx->cb_table_ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ctx->cb_table_ref);
+      ctx->cb_table_ref = LUA_NOREF;
+    }
+
+    if ((ret = close(ctx->fd)) < 0) return push_luaerror(L);
+
+    ctx->fd = -1;
+  }
+
+  lua_pushinteger(L, ret);
+  return 1;
+}
+
+static int l_gc(lua_State* L) {
+  inotify_ctx_t* ctx = luaL_checkudata(L, 1, INOTIFY_MT);
+
+  if (ctx->fd >= 0) {
+    if (ctx->cb_table_ref != LUA_NOREF) {
+      luaL_unref(L, LUA_REGISTRYINDEX, ctx->cb_table_ref);
+      ctx->cb_table_ref = LUA_NOREF;
+    }
+    close(ctx->fd);
+    ctx->fd = -1;
+  }
+
+  return 0;
+}
+
+static int l_init(lua_State* L) {
+  int fd = inotify_init1(IN_NONBLOCK);
+  if (fd < 0) return push_luaerror(L);
+
+  inotify_ctx_t* ctx = lua_newuserdata(L, sizeof(inotify_ctx_t));
+  ctx->fd = fd;
+  ctx->cb_table_ref = LUA_NOREF;
+
+  luaL_getmetatable(L, INOTIFY_MT);
+  lua_setmetatable(L, -2);
+
+  lua_newtable(L);
+  ctx->cb_table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+  return 1;
+}
+
+static int l_poll(lua_State* L) {
+  inotify_ctx_t* ctx = luaL_checkudata(L, 1, INOTIFY_MT);
+  int timeout = (int)luaL_optinteger(L, 2, -1);
+
+  struct pollfd pfd = {
+      .fd = ctx->fd,
+      .events = POLLIN,
+  };
+
+  int poll_ret = poll(&pfd, 1, timeout);
+  if (poll_ret < 0) return push_luaerror(L);
+
+  if (poll_ret == 0) {
+    lua_pushinteger(L, 0);
     return 1;
+  }
+
+  char buffer[EVENT_BUF_LEN];
+  ssize_t bytes_read = read(ctx->fd, buffer, sizeof(buffer));
+  if (bytes_read < 0) return push_luaerror(L);
+
+  if (bytes_read == 0) {
+    lua_pushinteger(L, 0);
+    return 1;
+  }
+
+  lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->cb_table_ref);
+
+  ssize_t offset = 0;
+  while (offset < bytes_read) {
+    struct inotify_event* ev = (struct inotify_event*)(buffer + offset);
+
+    lua_rawgeti(L, -1, ev->wd);
+    if (lua_isfunction(L, -1)) {
+      push_luaevent(L, ev);
+      if (lua_pcall(L, 1, 0, 0) != LUA_OK) return lua_error(L);
+    } else {
+      lua_pop(L, 1);
+    }
+
+    offset += sizeof(struct inotify_event) + ev->len;
+  }
+
+  lua_pop(L, 1);
+  lua_pushinteger(L, poll_ret);
+  return 1;
+}
+
+static const luaL_Reg methods[] = {{"__gc", l_gc},       {"add", l_add},
+                                   {"poll", l_poll},     {"close", l_close},
+                                   {"remove", l_remove}, {NULL, NULL}};
+
+static const luaL_Reg lib[] = {{"init", l_init}, {NULL, NULL}};
+
+#define ADD_CONST(L, name)  \
+  lua_pushinteger(L, name); \
+  lua_setfield(L, -2, #name);
+
+int luaopen_inotify(lua_State* L) {
+  luaL_newmetatable(L, INOTIFY_MT);
+
+#if LUA_VERSION_NUM > 501
+  luaL_setfuncs(L, methods, 0);
+#else
+  luaL_register(L, NULL, methods);
+#endif
+
+  lua_pushvalue(L, -1);
+  lua_setfield(L, -2, "__index");
+  lua_pop(L, 1);
+
+  lua_newtable(L);
+#if LUA_VERSION_NUM > 501
+  luaL_setfuncs(L, lib, 0);
+#else
+  luaL_register(L, NULL, lib);
+#endif
+
+  ADD_CONST(L, IN_ACCESS);
+  ADD_CONST(L, IN_MODIFY);
+  ADD_CONST(L, IN_ATTRIB);
+  ADD_CONST(L, IN_CLOSE_WRITE);
+  ADD_CONST(L, IN_CLOSE_NOWRITE);
+  ADD_CONST(L, IN_OPEN);
+  ADD_CONST(L, IN_MOVED_FROM);
+  ADD_CONST(L, IN_MOVED_TO);
+  ADD_CONST(L, IN_CREATE);
+  ADD_CONST(L, IN_DELETE);
+  ADD_CONST(L, IN_DELETE_SELF);
+  ADD_CONST(L, IN_MOVE_SELF);
+  ADD_CONST(L, IN_UNMOUNT);
+  ADD_CONST(L, IN_Q_OVERFLOW);
+  ADD_CONST(L, IN_IGNORED);
+  ADD_CONST(L, IN_ONLYDIR);
+  ADD_CONST(L, IN_DONT_FOLLOW);
+  ADD_CONST(L, IN_EXCL_UNLINK);
+  ADD_CONST(L, IN_MASK_ADD);
+  ADD_CONST(L, IN_ISDIR);
+  ADD_CONST(L, IN_ONESHOT);
+  ADD_CONST(L, IN_CLOSE);
+  ADD_CONST(L, IN_MOVE);
+  ADD_CONST(L, IN_ALL_EVENTS);
+
+  return 1;
 }
