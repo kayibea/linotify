@@ -6,6 +6,12 @@ A Lua binding for the Linux inotify library
 
 To build `inotify.so`, simply type `make`.
 
+Or with luarocks:
+```bash
+luarocks make
+```
+
+
 ## Usage
 
 ```lua
