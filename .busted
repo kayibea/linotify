@@ -1,0 +1,8 @@
+return {
+  coverage = true,
+  path = "spec",
+  pattern = "_spec.lua$",
+  output = "pretty",
+  color = true,
+  lua = "lua",
+}
