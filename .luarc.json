@@ -1,0 +1,6 @@
+{
+  "workspace.checkThirdParty": false,
+  "workspace.library": [
+    "${addons}/busted/module/library",
+  ]
+}
