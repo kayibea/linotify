@@ -1,39 +1,19 @@
+# Makefile for building the Lua inotify shared library
+# Note: this is not needed if you use LuaRocks to install the module
 
-SRCNAME = linotify.c
-OBJNAME = linotify.o
-LIBNAME = inotify.so
+CC      = cc
+CFLAGS  = -std=c99 -O2 -Wall -Wextra -Werror -fPIC
+LDFLAGS = -shared -llua
 
-# Gives a nice speedup but also spoils debugging on x86. Comment
-# out this line when debugging.
-OMIT_FRAME_POINTER = -fomit-frame-pointer
+SRC = linotify.c
+LIB = inotify.so
 
-# Seach for lua .pc file
-LUAPKG_CMD = $(shell pkg-config --list-all | grep Lua | awk 'FNR == 1 {print $$1}')
-CFLAGS = -fPIC -O3 -Wall $(shell pkg-config "$(LUAPKG_CMD)" --cflags)
-LFLAGS = -shared $(OMIT_FRAME_POINTER)
-INSTALL_PATH = $(shell pkg-config "$(LUAPKG_CMD)" --variable=INSTALL_CMOD)
+all: $(LIB)
 
-## If your system doesn't have pkg-config, comment out the previous
-## lines and uncomment and change the following ones according to your
-## building enviroment.
-
-#CFLAGS = -I/usr/include/lua5.1/ -fPIC -O3 -Wall
-#LFLAGS = -shared $(OMIT_FRAME_POINTER)
-#INSTALL_PATH = /usr/lib/lua/5.1
-
-all: $(LIBNAME)
-
-$(OBJNAME): $(SRCNAME)
-	$(CC) -o $(OBJNAME) -c $(SRCNAME) $(CFLAGS)
-
-$(LIBNAME): $(OBJNAME)
-	$(CC) -o $(LIBNAME) -shared $(OBJNAME) $(LFLAGS)
-
-install: $(LIBNAME)
-	install -D -s $(LIBNAME) $(DESTDIR)$(INSTALL_PATH)/$(LIBNAME)
+$(LIB): $(SRC)
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@
 
 clean:
-	$(RM) $(LIBNAME) $(OBJNAME)
+	rm -rf $(LIB)
 
-
-.PHONY: all install clean
+.PHONY: all clean
